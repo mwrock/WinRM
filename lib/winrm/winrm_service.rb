@@ -14,7 +14,6 @@
 
 require 'nori'
 require 'rexml/document'
-require 'zip'
 
 module WinRM
   # This is the main class that does the SOAP request/response logic. There are a few helper classes, but pretty
@@ -82,7 +81,7 @@ module WinRM
     # @option shell_opts [Hash] :env_vars environment variables to set for the shell. For instance;
     #   :env_vars => {:myvar1 => 'val1', :myvar2 => 'var2'}
     # @return [String] The ShellId from the SOAP response.  This is our open shell instance on the remote machine.
-    def open_shell(shell_opts = {})
+    def open_shell(shell_opts = {}, &block)
       i_stream = shell_opts.has_key?(:i_stream) ? shell_opts[:i_stream] : 'stdin'
       o_stream = shell_opts.has_key?(:o_stream) ? shell_opts[:o_stream] : 'stdout stderr'
       codepage = shell_opts.has_key?(:codepage) ? shell_opts[:codepage] : 437
@@ -114,7 +113,16 @@ module WinRM
 
       resp_doc = send_message(builder.target!)
       shell_id = REXML::XPath.first(resp_doc, "//*[@Name='ShellId']").text
-      shell_id
+
+      if block_given?
+        begin
+          yield shell_id
+        ensure
+          close_shell(shell_id)
+        end
+      else
+        shell_id
+      end
     end
 
     # Run a command on a machine with an open shell
@@ -122,7 +130,7 @@ module WinRM
     # @param [String] command The command to run on the remote machine
     # @param [Array<String>] arguments An array of arguments for this command
     # @return [String] The CommandId from the SOAP response.  This is the ID we need to query in order to get output.
-    def run_command(shell_id, command, arguments = [], cmd_opts = {})
+    def run_command(shell_id, command, arguments = [], cmd_opts = {}, &block)
       consolemode = cmd_opts.has_key?(:console_mode_stdin) ? cmd_opts[:console_mode_stdin] : 'TRUE'
       skipcmd     = cmd_opts.has_key?(:skip_cmd_shell) ? cmd_opts[:skip_cmd_shell] : 'FALSE'
 
@@ -148,22 +156,16 @@ module WinRM
 
       resp_doc = send_message(xml)
       command_id = REXML::XPath.first(resp_doc, "//#{NS_WIN_SHELL}:CommandId").text
-      command_id
-    end
-
-    def upload_path(local, remote)
-      @logger.debug("Upload: #{local} -> #{remote}")
-      local = Array.new(1) { local } if local.is_a? String
-      shell_id = open_shell
-      local.each do |path|
-        if File.directory?(path)
-          upload_directory(shell_id, path, remote)
-        else
-          upload_file(path, File.join(remote, File.basename(path)), shell_id)
+      
+      if block_given?
+        begin
+          yield command_id
+        ensure
+          cleanup_command(shell_id, command_id)
         end
+      else
+        command_id
       end
-    ensure
-      close_shell(shell_id)
     end
 
     def write_stdin(shell_id, command_id, stdin)
@@ -279,13 +281,12 @@ module WinRM
     # @param [Array <String>] arguments arguments to the command
     # @param [String] an existing and open shell id to reuse
     # @return [Hash] :stdout and :stderr
-    def run_cmd(command, arguments = [], shell_id = nil, &block)
-      shell_given = !shell_id.nil?
-      shell_id ||= open_shell
-      command_id =  run_command(shell_id, command, arguments)
-      command_output = get_command_output(shell_id, command_id, &block)
-      cleanup_command(shell_id, command_id)
-      close_shell(shell_id) unless shell_given
+    def run_cmd(command, arguments = [], &block)
+      open_shell do |shell_id|
+        run_command(shell_id, command, arguments) do |command_id|
+          command_output = get_command_output(shell_id, command_id, &block)
+        end
+      end
       command_output
     end
     alias :cmd :run_cmd
@@ -295,18 +296,12 @@ module WinRM
     # @param [IO,String] script_file an IO reference for reading the Powershell script or the actual file contents
     # @param [String] an existing and open shell id to reuse
     # @return [Hash] :stdout and :stderr
-    def run_powershell_script(script_file, shell_id = nil, &block)
-      shell_given = !shell_id.nil?
+    def run_powershell_script(script_file, &block)
       # if an IO object is passed read it..otherwise assume the contents of the file were passed
       script = script_file.kind_of?(IO) ? script_file.read : script_file
       script = script.encode('UTF-16LE', 'UTF-8')
       script = Base64.strict_encode64(script)
-      shell_id ||= open_shell
-      command_id = run_command(shell_id, "powershell -encodedCommand #{script}")
-      command_output = get_command_output(shell_id, command_id, &block)
-      cleanup_command(shell_id, command_id)
-      close_shell(shell_id) unless shell_given
-      command_output
+      run_cmd("powershell", ['-encodedCommand',script], &block)
     end
     alias :powershell :run_powershell_script
 
@@ -459,130 +454,6 @@ module WinRM
       {"#{NS_WSMAN_DMTF}:SelectorSet" =>
         {"#{NS_WSMAN_DMTF}:Selector" => shell_id, :attributes! => {"#{NS_WSMAN_DMTF}:Selector" => {'Name' => 'ShellId'}}}
       }
-    end
-
-    def upload_file(local, remote, shell_id)
-      @logger.debug("Upload: #{local} -> #{remote}")
-      remote = full_remote_path(remote, shell_id)
-      if should_upload_file?(shell_id, local, remote)
-        upload_to_remote(shell_id, local, remote)
-        decode_remote_file(shell_id, local, remote)
-      end
-    end
-
-    def full_remote_path(path, shell_id)
-      command = <<-EOH
-        $dest_file_path = [System.IO.Path]::GetFullPath('#{path}')
-
-        if (!(Test-Path $dest_file_path)) {
-          $dest_dir = ([System.IO.Path]::GetDirectoryName($dest_file_path))
-          New-Item -ItemType directory -Force -Path $dest_dir | Out-Null
-        }
-
-        $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath("#{path}")
-      EOH
-
-      powershell(command, shell_id)[:data][0][:stdout].chomp
-    end
-
-    def should_upload_file?(shell_id, local, remote)
-      @logger.debug("comparing #{local} to #{remote}")
-      local_md5 = Digest::MD5.file(local).hexdigest
-      command = <<-EOH
-        $dest_file_path = [System.IO.Path]::GetFullPath('#{remote}')
-
-        if (Test-Path $dest_file_path) {
-          $crypto_prov = new-object -TypeName System.Security.Cryptography.MD5CryptoServiceProvider
-          try {
-            $file = [System.IO.File]::Open($dest_file_path,
-              [System.IO.Filemode]::Open, [System.IO.FileAccess]::Read)
-            $guest_md5 = ([System.BitConverter]::ToString($crypto_prov.ComputeHash($file)))
-            $guest_md5 = $guest_md5.Replace("-","").ToLower()
-          }
-          finally {
-            $file.Dispose()
-          }
-          if ($guest_md5 -eq '#{local_md5}') {
-            exit 0
-          }
-        }
-        remove-item $dest_file_path -Force
-        exit 1
-      EOH
-      powershell(command, shell_id)[:exitcode] == 1
-    end
-
-    def upload_to_remote(shell_id, local, remote)
-      @logger.debug("Uploading '#{local}' to temp file '#{remote}'")
-      base64_host_file = Base64.encode64(IO.binread(local)).gsub("\n", "")
-      base64_host_file.chars.to_a.each_slice(8000 - remote.size) do |chunk|
-        output = cmd("echo #{chunk.join} >> \"#{remote}\"", [], shell_id)
-        raise_upload_error_if_failed(output, local, remote)
-      end
-    end
-
-    def upload_directory(shell_id, local, remote)
-      zipped = zip_path(local)
-      return if !File.exist?(zipped)
-      remote_zip = File.join(remote, File.basename(zipped))
-      @logger.debug("uploading #{zipped} to #{remote_zip}")
-      upload_file(zipped, remote_zip, shell_id)
-      extract_zip(remote_zip, local, shell_id)
-    end
-
-    def zip_path(path)
-      path.sub!(%r[/$],'')
-      archive = File.join(path,File.basename(path))+'.zip'
-      FileUtils.rm archive, :force=>true
-
-      Zip::File.open(archive, 'w') do |zipfile|
-        Dir["#{path}/**/**"].reject{|f|f==archive}.each do |file|
-          entry = Zip::Entry.new(archive, file.sub(path+'/',''), nil, nil, nil, nil, nil, nil, ::Zip::DOSTime.new(2000))
-          zipfile.add(entry,file)
-        end
-      end
-
-      archive
-    end
-
-    def extract_zip(remote_zip, local, shell_id)
-      @logger.debug("extracting #{remote_zip} to #{remote_zip.gsub('/','\\').gsub('.zip','')}")
-      command = <<-EOH
-        $shellApplication = new-object -com shell.application 
-        $zip_path = remote_zip.gsub('/','\\')}
-
-        $zipPackage = $shellApplication.NameSpace($zip_path) 
-        $dest_path = "$($env:systemDrive)#{remote_zip.gsub('/','\\').gsub('.zip','')}"
-        mkdir $dest_path -ErrorAction SilentlyContinue
-        $destinationFolder = $shellApplication.NameSpace($dest_path) 
-        $destinationFolder.CopyHere($zipPackage.Items(),0x10)
-      EOH
-
-      output = powershell(command, shell_id)
-      raise_upload_error_if_failed(output, local, remote_zip)
-    end
-
-    def decode_remote_file(shell_id, local, remote)
-      @logger.debug("Decoding temp file '#{remote}'")
-      command = <<-EOH
-        $tmp_file_path = [System.IO.Path]::GetFullPath('#{remote}')
-
-        $dest_dir = ([System.IO.Path]::GetDirectoryName($tmp_file_path))
-        New-Item -ItemType directory -Force -Path $dest_dir
-
-        $base64_string = Get-Content $tmp_file_path
-        $bytes = [System.Convert]::FromBase64String($base64_string)
-        [System.IO.File]::WriteAllBytes($tmp_file_path, $bytes)
-      EOH
-      output = powershell(command, shell_id)
-      raise_upload_error_if_failed(output, local, remote)
-    end
-
-    def raise_upload_error_if_failed(output, from, to)
-      raise UploadFailed,
-        :from => from,
-        :to => to,
-        :message => output.inspect unless output[:exitcode].zero?
     end
 
   end # WinRMWebService

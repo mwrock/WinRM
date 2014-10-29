@@ -132,7 +132,7 @@ module WinRM
           :to => remote_path,
           :message => command_output.inspect
       end
-      command_output[:data][0][:stdout].chomp
+      out_stream.join.chomp
     end
   end
 end

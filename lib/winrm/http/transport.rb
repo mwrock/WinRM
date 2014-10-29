@@ -65,7 +65,7 @@ module WinRM
       protected
 
       def log_soap_message(message)
-        return unless @logger.debug?
+        return #unless @logger.debug?
         
         xml_msg = REXML::Document.new(message)
         formatter = REXML::Formatters::Pretty.new(2)

@@ -10,8 +10,7 @@ module WinRM
     end
 
     def upload
-      super
-      extract_zip
+      extract_zip unless super == 0
     end
 
     private

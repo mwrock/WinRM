@@ -18,11 +18,13 @@ module WinRM
 
     def upload
       if should_upload_file?
-        upload_to_remote
+        size = upload_to_remote
         decode_remote_file
       else
+        size = 0
         logger.debug("Files are equal. Not copying #{local_path} to #{remote_path}")
       end
+      size
     end
     
     def close
@@ -77,11 +79,11 @@ module WinRM
             $file.Dispose()
           }
           if ($guest_md5 -eq '#{local_md5}') {
-            $false
+            return $false
           }
         }
         if(Test-Path $dest_file_path){remove-item $dest_file_path -Force}
-        $true
+        return $true
       EOH
       out = powershell(command)
       out == 'True'
@@ -90,9 +92,11 @@ module WinRM
     def upload_to_remote
       logger.debug("Uploading '#{local_path}' to temp file '#{remote_path}'")
       base64_host_file = Base64.encode64(IO.binread(local_path)).gsub("\n", "")
-      base64_host_file.chars.to_a.each_slice(8000 - remote_path.size) do |chunk|
+      base64_array = base64_host_file.chars.to_a
+      base64_array.each_slice(8000 - remote_path.size) do |chunk|
         cmd("echo #{chunk.join} >> \"#{remote_path}\"")
       end
+      base64_array.length
     end
 
     def decode_remote_file
@@ -122,9 +126,6 @@ module WinRM
           err_stream << stderr if stderr
         end
       end
-
-      logger.debug(out_stream)
-      logger.debug(err_stream)
 
       if !command_output[:exitcode].zero? or !err_stream.empty?
         raise UploadFailed,
